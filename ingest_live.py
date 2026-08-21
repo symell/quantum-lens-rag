@@ -29,7 +29,7 @@ from dotenv import load_dotenv
 import tiktoken
 from datetime import datetime, timezone
 
-load_dotenv()
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
 openai_client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 pc = Pinecone(api_key=os.getenv('PINECONE_API_KEY'))
@@ -387,19 +387,22 @@ def generate_alert_text(title, lens, changed_text=''):
                 'Review the official source for full details.')
     try:
         prompt = (
-            'Write a 3-sentence UK regulatory alert for advisers and affected individuals. '
-            'Sentence 1: What changed and when (be specific, cite the law or body if known). '
-            'Sentence 2: Who is affected and why it matters. '
-            'Sentence 3: ONE specific action starting with an imperative verb such as Check, Review, Update, Verify, Ensure, Apply, Register, Confirm, Report, Audit, Diarise, Seek, Calculate, Claim. '
-            'Topic: ' + title + '. Lens/area: ' + lens + '. '
-            + ('Context: ' + changed_text[:500] if changed_text else '') +
-            ' Be factual, specific, and concise. No generic phrases.'
+            'Write a UK regulatory alert in exactly 3 sentences. '
+            'Plain text only — no markdown, no bold, no asterisks, no bullet points. '
+            'Sentence 1: What specifically changed and when. Name the legislation or body. '
+            'Sentence 2: Who is affected and the practical consequence. '
+            'Sentence 3: One specific action starting with exactly one of these words: '
+            'Check, Review, Update, Verify, Ensure, Apply, Register, Confirm, Report, Audit, Diarise, Seek, Calculate, Claim. '
+            'Maximum 80 words total. '
+            'Topic: ' + title + '. Regulatory area: ' + lens + '. '
+            + ('Additional context: ' + changed_text[:300] if changed_text else '') +
+            ' Do not mention individual court cases, case numbers, statistics publications, or transparency data releases.'
         )
         response = requests.post(
             'https://api.anthropic.com/v1/messages',
             json={
                 'model': 'claude-sonnet-4-6',
-                'max_tokens': 200,
+                'max_tokens': 150,
                 'messages': [{'role': 'user', 'content': prompt}]
             },
             headers={
@@ -410,14 +413,16 @@ def generate_alert_text(title, lens, changed_text=''):
             timeout=20
         )
         if response.status_code == 200:
-            return response.json()['content'][0]['text'].strip()
+            text = response.json()['content'][0]['text'].strip()
+            # Remove any markdown formatting that slipped through
+            text = text.replace('**', '').replace('*', '').replace('__', '')
+            return text
     except Exception as e:
         print('  Claude alert generation failed: ' + str(e))
 
     return (title + ' has been updated. '
             'Check how this change affects your ' + lens + ' situation. '
             'Review the official source and update your records accordingly.')
-
 
 def push_alert_to_supabase(lens, topic, title, alert_text, source_url='', impact='Medium'):
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
@@ -577,18 +582,15 @@ def delete_from_pinecone(source_id):
 
 
 # ── RSS MONITORING ────────────────────────────────────────────────────
-
 def monitor_rss_feeds():
     print('=' * 60)
     print('Quantum Lens — Real-Time RSS Monitor')
     print('Time: ' + datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
     print('=' * 60)
-
     state = load_json(MONITOR_STATE_FILE) or {'seen_entries': []}
     seen_entries = set(state.get('seen_entries', []))
     alerts_pushed = 0
     new_seen = []
-
     for feed_config in RSS_FEEDS:
         feed_url = feed_config['url']
         feed_name = feed_config['name']
@@ -605,6 +607,18 @@ def monitor_rss_feeds():
                 summary = entry.get('summary', '')
                 combined = (title + ' ' + summary).lower()
                 if not any(kw in combined for kw in keywords):
+                    new_seen.append(entry_id)
+                    continue
+                # Skip individual cases, statistics and minor publications
+                skip_patterns = [
+                    ' v ', ' -v- ', 'case no', 'case number',
+                    'official statistics', 'transparency data',
+                    'foi release', 'minutes of', 'quarterly statistics',
+                    'statistical bulletin', 'management information',
+                    'research and analysis', 'independent report',
+                    'corporate report', 'promotional material',
+                ]
+                if any(p in title.lower() for p in skip_patterns):
                     new_seen.append(entry_id)
                     continue
                 lens = detect_lens_from_text(combined)
@@ -625,14 +639,10 @@ def monitor_rss_feeds():
                 print('  No new relevant updates')
         except Exception as e:
             print('  Error: ' + str(e))
-
     all_seen = list(seen_entries) + new_seen
     state['seen_entries'] = all_seen[-1000:]
     state['last_check'] = datetime.now().isoformat()
     save_json(MONITOR_STATE_FILE, state)
-    print('\n' + '=' * 60)
-    print('RSS Monitor complete — ' + str(alerts_pushed) + ' alerts pushed to Supabase')
-    print('=' * 60)
 
 
 # ── HASH MONITORING ───────────────────────────────────────────────────
